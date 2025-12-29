@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Conferência Pro - Filtro de Cancelados</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.25/jspdf.plugin.autotable.min.js"></script>
+    
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; padding: 20px; background-color: #f4f7f6; text-align: center; }
+        .container { max-width: 850px; margin: 0 auto; background: white; padding: 25px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
+        
+        /* Painel de Contagem */
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+        .stat-card { padding: 15px; border-radius: 10px; color: white; font-weight: bold; }
+        .stat-total { background-color: #2c3e50; }
+        .stat-ok { background-color: #27ae60; }
+        .stat-cancel { background-color: #e74c3c; }
+        .stat-dup { background-color: #f39c12; }
+        .stat-val { display: block; font-size: 1.8rem; }
+
+        .btn { padding: 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 1rem; font-weight: bold; transition: 0.3s; margin: 5px; }
+        .btn-sync { background-color: #6f42c1; color: white; width: 100%; }
+        .btn-pdf { background-color: #e74c3c; color: white; flex: 2; }
+        .btn-clear { background-color: #95a5a6; color: white; flex: 1; }
+
+        #result-box { 
+            padding: 30px; margin: 20px 0; border-radius: 10px; color: white;
+            font-size: 1.8rem; font-weight: bold; min-height: 80px;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+        .bg-idle { background-color: #bdc3c7; }
+        .bg-ok { background-color: #2ecc71; }
+        .bg-cancel { background-color: #e74c3c; }
+        .bg-dup { background-color: #f1c40f; color: #333 !important; }
+
+        #reader { width: 100%; border-radius: 10px; overflow: hidden; background: #000; }
+        
+        .driver-info { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin: 20px 0; padding: 15px; background: #f9f9f9; border-radius: 8px; border: 1px solid #ddd; }
+        .driver-info input { padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 25px; }
+        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
+        th { background-color: #f8f9fa; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>📡 Controle de Embarque</h2>
+
+    <div class="stats-grid">
+        <div class="stat-card stat-total"><span id="c-total" class="stat-val">0</span>Total</div>
+        <div class="stat-card stat-ok"><span id="c-ok" class="stat-val">0</span>Liberados</div>
+        <div class="stat-card stat-cancel"><span id="c-cancel" class="stat-val">0</span>Cancelados</div>
+        <div class="stat-card stat-dup"><span id="c-dup" class="stat-val">0</span>Duplicados</div>
+    </div>
+
+    <button class="btn btn-sync" onclick="sincronizarDados()">🔄 Baixar Planilha (GitHub/cancelados.xlsx)</button>
+    <div id="dbStatus" style="font-size: 0.9rem; margin: 10px 0; font-weight: bold; color: #555;">Status: Aguardando sincronização...</div>
+
+    <div id="result-box" class="bg-idle">Aguardando Bipagem</div>
+    <div id="reader"></div>
+
+    <div class="driver-info">
+        <input type="text" id="motorista" placeholder="Nome do Motorista">
+        <input type="text" id="cpf" placeholder="CPF">
+        <input type="text" id="placa" placeholder="Placa do Veículo">
+    </div>
+
+    <div style="display: flex; gap: 10px;">
+        <button class="btn btn-pdf" onclick="gerarPDF()">📄 Gerar PDF com Assinaturas</button>
+        <button class="btn btn-clear" onclick="clearData()">🗑️ Limpar Sessão</button>
+    </div>
+
+    <h3 style="text-align: left;">Histórico da Carga</h3>
+    <table id="historyTable">
+        <thead><tr><th>Código Lido</th><th>Status</th><th>Horário</th></tr></thead>
+        <tbody></tbody>
+    </table>
+</div>
+
+<script>
+    let cancelledDB = []; 
+    let sessionScans = JSON.parse(localStorage.getItem('scans_v4')) || [];
+    let isLocked = false;
+    const NOME_ARQUIVO_EXCEL = "cancelados.xlsx"; 
+
+    updateTable();
+    updateStats();
+
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playTone(freq, type, duration) {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type; osc.frequency.value = freq;
+        osc.connect(gain); gain.connect(audioCtx.destination);
+        osc.start(); gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + duration);
+        osc.stop(audioCtx.currentTime + duration);
+    }
+
+    async function sincronizarDados() {
+        const statusEl = document.getElementById('dbStatus');
+        statusEl.innerText = "⏳ Sincronizando...";
+        try {
+            const res = await fetch(NOME_ARQUIVO_EXCEL + '?v=' + new Date().getTime());
+            if (!res.ok) throw new Error("Arquivo não encontrado!");
+            const arrayBuffer = await res.arrayBuffer();
+            const wb = XLSX.read(arrayBuffer, { type: 'array' });
+            const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+            
+            // Carrega todos os códigos possíveis da planilha (ID ou Rastreio)
+            cancelledDB = data.map(row => {
+                let val = row['ID do pedido'] || row['ID do Pedido'] || row['Nº de Rastreio'] || row['Rastreio'];
+                return String(val || "").trim().toUpperCase();
+            }).filter(v => v !== "");
+
+            statusEl.innerText = `✅ Sucesso: ${cancelledDB.length} itens carregados.`;
+            statusEl.style.color = "green";
+        } catch (e) {
+            statusEl.innerText = "❌ Erro ao baixar planilha: " + e.message;
+            statusEl.style.color = "red";
+        }
+    }
+
+    function onScanSuccess(decodedText) {
+        if (isLocked) return;
+        isLocked = true;
+
+        const lido = String(decodedText).trim().toUpperCase();
+        let status = 'ok', msg = 'LIBERADO', css = 'bg-ok';
+
+        // 1. Verificar Duplicado
+        if (sessionScans.some(s => s.code === lido)) {
+            status = 'dup'; msg = 'DUPLICADO'; css = 'bg-dup';
+            playTone(600, 'square', 0.2);
+        } 
+        // 2. Busca Parcial (Verifica se o lido está contido na planilha OU vice-versa)
+        else {
+            const encontrado = cancelledDB.some(planilha => {
+                return planilha.includes(lido) || lido.includes(planilha);
+            });
+
+            if (encontrado) {
+                status = 'cancel'; msg = 'CANCELADO!'; css = 'bg-cancel';
+                playTone(150, 'sawtooth', 0.8);
+            } else {
+                playTone(1000, 'sine', 0.2);
+            }
+        }
+
+        saveScan(lido, status, msg);
+        const box = document.getElementById('result-box');
+        box.className = css;
+        box.innerHTML = `<div>${msg}</div><div style="font-size:0.9rem">${lido}</div>`;
+
+        setTimeout(() => {
+            isLocked = false;
+            box.className = "bg-idle";
+            box.innerHTML = "Aguardando Bipagem";
+        }, 1800);
+    }
+
+    function saveScan(code, status, msg) {
+        sessionScans.unshift({ code, status, msg, time: new Date().toLocaleTimeString() });
+        localStorage.setItem('scans_v4', JSON.stringify(sessionScans));
+        updateTable();
+        updateStats();
+    }
+
+    function updateStats() {
+        document.getElementById('c-total').innerText = sessionScans.length;
+        document.getElementById('c-ok').innerText = sessionScans.filter(s => s.status === 'ok').length;
+        document.getElementById('c-cancel').innerText = sessionScans.filter(s => s.status === 'cancel').length;
+        document.getElementById('c-dup').innerText = sessionScans.filter(s => s.status === 'dup').length;
+    }
+
+    function updateTable() {
+        const tbody = document.querySelector("#historyTable tbody");
+        tbody.innerHTML = sessionScans.slice(0, 10).map(s => 
+            `<tr><td>${s.code}</td><td style="color:${s.status==='cancel'?'red':(s.status==='dup'?'orange':'green')}">${s.msg}</td><td>${s.time}</td></tr>`
+        ).join('');
+    }
+
+    function clearData() {
+        if(confirm('Limpar dados da sessão?')) {
+            sessionScans = [];
+            localStorage.removeItem('scans_v4');
+            updateTable();
+            updateStats();
+        }
+    }
+
+    function gerarPDF() {
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF();
+        const dataHoje = new Date().toLocaleDateString();
+        
+        doc.setFontSize(16);
+        doc.text("Relatório de Conferência de Carga", 105, 15, { align: "center" });
+        
+        doc.setFontSize(10);
+        doc.text(`Motorista: ${document.getElementById('motorista').value || 'Não informado'}`, 15, 25);
+        doc.text(`CPF: ${document.getElementById('cpf').value || 'Não informado'}`, 15, 30);
+        doc.text(`Placa: ${document.getElementById('placa').value || 'Não informado'}`, 15, 35);
+        
+        doc.autoTable({
+            head: [['Código', 'Status Final', 'Hora']],
+            body: sessionScans.map(s => [s.code, s.msg, s.time]),
+            startY: 45,
+            headStyles: { fillColor: [44, 62, 80] }
+        });
+
+        const finalY = doc.lastAutoTable.finalY + 20;
+        doc.text(`São Paulo, ${dataHoje}`, 15, finalY);
+        
+        const sigLine = "_____________________";
+        doc.text(sigLine, 15, finalY + 25);
+        doc.text("Estoque", 15, finalY + 30);
+        
+        doc.text(sigLine, 80, finalY + 25);
+        doc.text("Motorista", 80, finalY + 30);
+        
+        doc.text("___________________", 145, finalY + 25);
+        doc.text("CPF", 145, finalY + 30);
+        
+        doc.text("_______________", 180, finalY + 25, {align: 'right'});
+        doc.text("Placa", 180, finalY + 30, {align: 'right'});
+
+        doc.save(`conferencia_${dataHoje.replace(/\//g, '-')}.pdf`);
+    }
+
+    const html5QrCode = new Html5Qrcode("reader");
+    html5QrCode.start({ facingMode: "environment" }, { fps: 15, qrbox: { width: 250, height: 150 } }, onScanSuccess);
+    window.onload = () => setTimeout(sincronizarDados, 1000);
+</script>
+</body>
+</html>
