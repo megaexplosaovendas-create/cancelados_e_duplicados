@@ -45,6 +45,9 @@
         table { width: 100%; border-collapse: collapse; margin-top: 25px; }
         th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
         th { background-color: #f8f9fa; }
+        
+        /* Indicador visual de scanner */
+        .scanner-mode { font-size: 0.8rem; color: #666; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -63,6 +66,7 @@
     <div id="dbStatus" style="font-size: 0.9rem; margin: 10px 0; font-weight: bold; color: #555;">Status: Aguardando sincronização...</div>
 
     <div id="result-box" class="bg-idle">Aguardando Bipagem</div>
+    <div class="scanner-mode">✅ Bipador USB/Bluetooth Ativo | 📷 Câmera Ativa</div>
     <div id="reader"></div>
 
     <div class="driver-info">
@@ -233,6 +237,37 @@
         doc.save(`conferencia_${dataHoje.replace(/\//g, '-')}.pdf`);
     }
 
+    // --- RECURSO: BIPADOR USB (Listener de Teclado) ---
+    let barcodeBuffer = "";
+    let lastKeyTime = Date.now();
+
+    document.addEventListener('keydown', (e) => {
+        const target = e.target;
+        // Se estiver digitando no form do motorista, não faz nada
+        if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
+        // Se demorar muito entre uma tecla e outra, zera (evita lixo de memória)
+        const currentTime = Date.now();
+        if (currentTime - lastKeyTime > 200) {
+            barcodeBuffer = "";
+        }
+        lastKeyTime = currentTime;
+
+        // Bipadores geralmente enviam "Enter" no final
+        if (e.key === "Enter") {
+            if (barcodeBuffer.length > 1) { // Evita leituras vazias
+                onScanSuccess(barcodeBuffer);
+                barcodeBuffer = ""; // Limpa para o próximo
+            }
+        } else {
+            // Acumula os caracteres (apenas letras e números e símbolos comuns)
+            if (e.key.length === 1) {
+                barcodeBuffer += e.key;
+            }
+        }
+    });
+
+    // Câmera (Mantida)
     const html5QrCode = new Html5Qrcode("reader");
     html5QrCode.start({ facingMode: "environment" }, { fps: 15, qrbox: { width: 250, height: 150 } }, onScanSuccess);
     window.onload = () => setTimeout(sincronizarDados, 1000);
